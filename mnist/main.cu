@@ -27,6 +27,34 @@ __global__ void forward(int batch_size, int n, int out_w, float *input,
   }
 }
 
+#define TILE_WIDTH 8
+__global__ void matmul(int w, int h, float *a, float *b, float *c) {
+  __shared__ float a_tile[TILE_WIDTH][TILE_WIDTH];
+  __shared__ float b_tile[TILE_WIDTH][TILE_WIDTH];
+  int col = blockIdx.x * TILE_WIDTH + threadIdx.x;
+  int row = blockIdx.y * TILE_WIDTH + threadIdx.y;
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+  float dot_prod = 0.f;
+
+  int max_dim = w > h ? w : h;
+  for (int tile_offset = 0; tile_offset < max_dim; tile_offset += TILE_WIDTH) {
+    int a_chk = (tile_offset + tx) < w && row < h;
+    a_tile[ty][tx] = a_chk ? a[row * w + tile_offset + tx] : 0.f;
+    int b_chk = (tile_offset + ty) < h && col < w;
+    b_tile[ty][tx] = b_chk ? b[(tile_offset + ty) * h + col] : 0.f;
+
+    __syncthreads();
+    for (int i = 0; i < TILE_WIDTH; i++) {
+      dot_prod += a_tile[ty][i] * b_tile[i][tx];
+    }
+    __syncthreads();
+  }
+  if (row < h && col < w) {
+    c[row * w + col] = dot_prod;
+  }
+}
+
 __global__ void relu(int w, int h, float *input, float *output) {
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -232,7 +260,6 @@ int main(void) {
     init_weights<<<gridDimWeights1, blockDim2D>>>(hidden_dim, input_dim,
                                                   d_weights1);
     cudaSafeCall(cudaPeekAtLastError());
-    cudaSafeCall(cudaDeviceSynchronize());
 
     // Layer 2 (Hidden -> Output)
     float *d_weights2, *d_biases2;
@@ -248,7 +275,6 @@ int main(void) {
     init_weights<<<gridDimWeights2, blockDim2D>>>(output_dim, hidden_dim,
                                                   d_weights2);
     cudaSafeCall(cudaPeekAtLastError());
-    cudaSafeCall(cudaDeviceSynchronize());
 
     // Intermediate buffers for activations, logits, predictions, and loss
     float *d_hidden_linear, *d_hidden_activation;
@@ -296,12 +322,10 @@ int main(void) {
                                          d_images, d_weights1, d_biases1,
                                          d_hidden_linear);
       cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
 
       relu<<<gridForward1, block2D>>>(hidden_dim, batch_size, d_hidden_linear,
                                       d_hidden_activation);
       cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
 
       dim3 gridForward2((output_dim + block2D.x - 1) / block2D.x,
                         (batch_size + block2D.y - 1) / block2D.y);
@@ -309,16 +333,40 @@ int main(void) {
                                          d_hidden_activation, d_weights2,
                                          d_biases2, d_output_logits);
       cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
 
       softmax<<<gridForward2, block2D>>>(output_dim, batch_size,
                                          d_output_logits, d_predictions);
       cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
 
       cross_entropy<<<gridSizeLoss, blockSize1D>>>(
           output_dim, batch_size, d_predictions, d_labels, d_loss);
       cudaSafeCall(cudaPeekAtLastError());
+
+      // --- Backward Pass ---
+      cross_entropy_backwards<<<gridForward2, block2D>>>(
+          output_dim, batch_size, d_predictions, d_labels, d_grad_output);
+      cudaSafeCall(cudaPeekAtLastError());
+
+      update_layer<<<gridForward2, block2D>>>(
+          output_dim, hidden_dim, batch_size, learning_rate, d_weights2,
+          d_biases2, d_hidden_activation, d_grad_output);
+      cudaSafeCall(cudaPeekAtLastError());
+
+      backwards<<<gridForward2, block2D>>>(batch_size, hidden_dim, output_dim,
+                                           d_weights2, d_biases2, d_grad_output,
+                                           d_grad_hidden);
+      cudaSafeCall(cudaPeekAtLastError());
+
+      relu_backwards<<<gridForward1, block2D>>>(hidden_dim, batch_size,
+                                                d_hidden_linear, d_grad_hidden,
+                                                d_hidden_linear);
+      cudaSafeCall(cudaPeekAtLastError());
+
+      update_layer<<<gridForward1, block2D>>>(
+          hidden_dim, input_dim, batch_size, learning_rate, d_weights1,
+          d_biases1, d_images, d_hidden_linear);
+      cudaSafeCall(cudaPeekAtLastError());
+
       cudaSafeCall(cudaDeviceSynchronize());
 
       std::vector<float> loss_host(batch_size);
@@ -333,36 +381,6 @@ int main(void) {
       std::cout << "Iteration " << iter << " Epoch "
                 << iter * batch_size / num_samples << " - Loss: " << avg_loss
                 << std::endl;
-
-      // --- Backward Pass ---
-      cross_entropy_backwards<<<gridForward2, block2D>>>(
-          output_dim, batch_size, d_predictions, d_labels, d_grad_output);
-      cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
-
-      update_layer<<<gridForward2, block2D>>>(
-          output_dim, hidden_dim, batch_size, learning_rate, d_weights2,
-          d_biases2, d_hidden_activation, d_grad_output);
-      cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
-
-      backwards<<<gridForward2, block2D>>>(batch_size, hidden_dim, output_dim,
-                                           d_weights2, d_biases2, d_grad_output,
-                                           d_grad_hidden);
-      cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
-
-      relu_backwards<<<gridForward1, block2D>>>(hidden_dim, batch_size,
-                                                d_hidden_linear, d_grad_hidden,
-                                                d_hidden_linear);
-      cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
-
-      update_layer<<<gridForward1, block2D>>>(
-          hidden_dim, input_dim, batch_size, learning_rate, d_weights1,
-          d_biases1, d_images, d_hidden_linear);
-      cudaSafeCall(cudaPeekAtLastError());
-      cudaSafeCall(cudaDeviceSynchronize());
     }
 
     cudaSafeCall(cudaFree(d_images));

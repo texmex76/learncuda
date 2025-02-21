@@ -1,0 +1,37 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 18
+  },
+  "configurePresets": [
+    {
+      "name": "release",
+      "description": "Release mode with optimizations",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "debug",
+      "description": "Debug mode with debugging symbols on host and device",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "ptxas",
+      "description": "PTXAS verbose mode (inherits Debug mode + ptxas options)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-ptxas",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "PTXAS"
+      }
+    }
+  ]
+}
+
